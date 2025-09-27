@@ -1,0 +1,96 @@
+name: RDP
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    steps:
+      # 1) Admin
+      - name: Elevate
+        shell: cmd
+        run: |
+          net session >nul 2>&1
+          if %errorLevel% neq 0 (
+            powershell -Command "Start-Process cmd -ArgumentList '/c','%~nx0','%*' -Verb RunAs"
+            exit /b
+          )
+
+      # 2) Python 3.12.4 portable
+      - name: Install Python
+        shell: pwsh
+        run: |
+          $pyUrl = "https://www.python.org/ftp/python/3.12.4/python-3.12.4-embed-amd64.zip"
+          $pyDir = "C:\toolbox\python"
+          New-Item -ItemType Directory -Path $pyDir -Force | Out-Null
+          Invoke-WebRequest -Uri $pyUrl -OutFile "$env:TEMP\py.zip"
+          Expand-Archive -Path "$env:TEMP\py.zip" -DestinationPath $pyDir -Force
+          echo "$pyDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$pyDir\python.exe" -VV
+
+      # 3) RDP settings
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "SecurityLayer" -value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      # 4) Create user
+      - name: Create User
+        shell: pwsh
+        run: |
+          $pass = ConvertTo-SecureString "admin@123" -AsPlainText -Force
+          if (!(Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "TOOLBOXLAP" -Password $pass -AccountNeverExpires
+              Add-LocalGroupMember -Group Administrators -Member "TOOLBOXLAP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
+          }
+
+      # 5) Install Tailscale (fixed)
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msi   = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $msi
+          Start-Process -FilePath msiexec.exe -Wait -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart"
+          Remove-Item $msi -Force
+
+      # 6) Connect & get IP
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner
+          $retries = 0; $tsIP = $null
+          while ([string]::IsNullOrWhiteSpace($tsIP) -and $retries -lt 20) {
+              Start-Sleep -Seconds 5
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $retries++
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      # 7) Print access info
+      - name: Print Info
+        shell: pwsh
+        run: |
+          python --version
+          Write-Host "=== RDP READY ==="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: TOOLBOXLAP"
+          Write-Host "Password: admin@123"
+          Write-Host "=================="
+
+      # 8) Keep alive
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] Running..."
+              Start-Sleep -Seconds 300
+          }
